@@ -76,11 +76,17 @@ func (p Prefix) Parent() string {
 func (p Prefix) Host() string { return p.Location + hostSuffix }
 
 // Matches reports whether a package belongs to this prefix's subtree.
+//
+// The test is a plain string prefix, not a path prefix, so the subpath "ltv2-"
+// matches the package "ltv2-extra" as well as "ltv2-/nested". That is
+// deliberate: Artifact Registry's cleanup policies scope by
+// PackageNamePrefixes, which is documented as "applied on any prefix match"
+// and offers no path-aware form. Matching the same way here keeps the set of
+// images garbagetruck protects identical to the set a policy it installs would
+// delete. A path-aware test would be tidier and would quietly leave
+// "ltv2-extra" unprotected but deletable.
 func (p Prefix) Matches(pkg string) bool {
-	if p.Subpath == "" {
-		return true
-	}
-	return pkg == p.Subpath || strings.HasPrefix(pkg, p.Subpath+"/")
+	return strings.HasPrefix(pkg, p.Subpath)
 }
 
 // Repo is the image name a manifest would write for a package in this

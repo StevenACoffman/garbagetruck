@@ -36,6 +36,30 @@ func TestRun(t *testing.T) {
 			args:        []string{"sync", "--manifest-repo", "github.com/Khan/districts-k8s"},
 			wantErrText: "sync: --registry-prefix is required",
 		},
+		"policy is registered and documents its flags": {
+			args:    []string{"policy", "--help"},
+			wantErr: ff.ErrHelp,
+			wantOutput: []string{
+				"registry-prefix", "delete-older-than", "keep-most-recent",
+				"cleanup-dry-run", "dry-run",
+			},
+		},
+		"policy refuses to run without a registry prefix": {
+			args:        []string{"policy"},
+			wantErrText: "policy: --registry-prefix is required",
+		},
+		"policy rejects a non-positive retention window": {
+			args: []string{
+				"policy", "-p", "us-central1-docker.pkg.dev/p/r", "--delete-older-than", "0s",
+			},
+			wantErrText: "policy: --delete-older-than must be positive",
+		},
+		"policy rejects a negative keep count": {
+			args: []string{
+				"policy", "-p", "us-central1-docker.pkg.dev/p/r", "--keep-most-recent", "-1",
+			},
+			wantErrText: "policy: --keep-most-recent must be between 0 and",
+		},
 		"no subcommand is not a failure": {
 			args:    nil,
 			wantErr: ff.ErrNoExec,

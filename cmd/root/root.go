@@ -41,7 +41,7 @@ func New(stdin io.Reader, stdout, stderr io.Writer) *Config {
 	cfg.Command = &ff.Command{
 		Name:      "garbagetruck",
 		Usage:     "garbagetruck <SUBCOMMAND> ...",
-		ShortHelp: "TODO: describe garbagetruck here",
+		ShortHelp: "protect in-use container images from registry cleanup",
 	}
 	return &cfg
 }

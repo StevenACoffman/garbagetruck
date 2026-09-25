@@ -7,11 +7,14 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	artifactregistry "cloud.google.com/go/artifactregistry/apiv1"
 	"cloud.google.com/go/artifactregistry/apiv1/artifactregistrypb"
+	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/StevenACoffman/garbagetruck/internal/garbagetruck"
@@ -20,6 +23,12 @@ import (
 // cloudPlatformScope is the scope an impersonated token needs to read and tag
 // Artifact Registry contents.
 const cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
+
+// retryInitial and retryMax bound the backoff between read attempts.
+const (
+	retryInitial = 250 * time.Millisecond
+	retryMax     = 10 * time.Second
+)
 
 // Client reads and edits the Docker images an Artifact Registry repository
 // holds. Close it when done.
@@ -63,7 +72,7 @@ func (c *Client) Close() error {
 func (c *Client) List(ctx context.Context, prefix Prefix) ([]garbagetruck.Image, error) {
 	var images []garbagetruck.Image
 	request := &artifactregistrypb.ListPackagesRequest{Parent: prefix.Parent()}
-	for pkg, err := range c.ar.ListPackages(ctx, request).All() {
+	for pkg, err := range c.ar.ListPackages(ctx, request, retryReads()).All() {
 		if err != nil {
 			return nil, fmt.Errorf("list packages in %s: %w", prefix.Parent(), err)
 		}
@@ -127,6 +136,45 @@ func (c *Client) Apply(
 	return applied, errors.Join(errs...)
 }
 
+// ReadPolicies returns the repository's cleanup configuration: every policy on
+// it, garbagetruck's own and anyone else's, plus whether the cleanup pipeline
+// is currently held back.
+func (c *Client) ReadPolicies(ctx context.Context, prefix Prefix) (Policies, error) {
+	repo, err := c.ar.GetRepository(ctx, &artifactregistrypb.GetRepositoryRequest{
+		Name: prefix.Parent(),
+	}, retryReads())
+	if err != nil {
+		return Policies{}, fmt.Errorf("get repository %s: %w", prefix.Parent(), err)
+	}
+	return Policies{ByID: repo.GetCleanupPolicies(), DryRun: repo.GetCleanupPolicyDryRun()}, nil
+}
+
+// WritePolicies replaces the repository's cleanup configuration with want.
+//
+// The field mask names only the two fields being set, so nothing else on the
+// repository — encryption keys, access settings, labels — can be disturbed by
+// this call. want must already carry the policies garbagetruck does not
+// manage, because the map field is replaced wholesale; see PlanPolicies.
+//
+// With Apply, this is one of only two functions in garbagetruck that modify a
+// registry. A dry run is implemented by not reaching either of them.
+func (c *Client) WritePolicies(ctx context.Context, prefix Prefix, want Policies) error {
+	_, err := c.ar.UpdateRepository(ctx, &artifactregistrypb.UpdateRepositoryRequest{
+		Repository: &artifactregistrypb.Repository{
+			Name:                prefix.Parent(),
+			CleanupPolicies:     want.ByID,
+			CleanupPolicyDryRun: want.DryRun,
+		},
+		UpdateMask: &fieldmaskpb.FieldMask{
+			Paths: []string{"cleanup_policies", "cleanup_policy_dry_run"},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("update cleanup policies on %s: %w", prefix.Parent(), err)
+	}
+	return nil
+}
+
 // listVersions reads one package's versions. VersionView_FULL is what makes
 // the response carry RelatedTags, which saves a ListTags call per package.
 func (c *Client) listVersions(ctx context.Context, pkg string) ([]garbagetruck.Version, error) {
@@ -135,7 +183,7 @@ func (c *Client) listVersions(ctx context.Context, pkg string) ([]garbagetruck.V
 		View:   artifactregistrypb.VersionView_FULL,
 	}
 	var versions []garbagetruck.Version
-	for version, err := range c.ar.ListVersions(ctx, request).All() {
+	for version, err := range c.ar.ListVersions(ctx, request, retryReads()).All() {
 		if err != nil {
 			return nil, fmt.Errorf("list versions in %s: %w", pkg, err)
 		}
@@ -223,4 +271,23 @@ func resourceID(resource, section string) (string, bool) {
 		return id, true
 	}
 	return unescaped, true
+}
+
+// retryReads retries the transient failures a fan-out read runs into on a
+// large repository. The generated client sets a per-attempt timeout but
+// configures no retry at all, so a single Unavailable in a listing that spans
+// hundreds of RPCs aborts the whole run — which is how this was found.
+//
+// Only reads get this. The tag and policy writes are not idempotent at the RPC
+// level: replaying a CreateTag that did reach the server fails with
+// AlreadyExists, and a replayed DeleteTag with NotFound. Re-running the
+// command is the safe retry for those, because a whole run is idempotent even
+// though its individual calls are not.
+func retryReads() gax.CallOption {
+	return gax.WithRetry(func() gax.Retryer {
+		return gax.OnCodes(
+			[]codes.Code{codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted},
+			gax.Backoff{Initial: retryInitial, Max: retryMax, Multiplier: 2},
+		)
+	})
 }

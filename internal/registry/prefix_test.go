@@ -102,7 +102,10 @@ func TestPrefixMatches(t *testing.T) {
 		"subpath takes itself":              {districtsJobs + "/a", "a", true},
 		"subpath takes its children":        {districtsJobs + "/a", "a/b", true},
 		"subpath rejects a sibling":         {districtsJobs + "/a", "b", false},
-		"subpath is not a string prefix":    {districtsJobs + "/a", "ab", false},
+		// A plain string prefix, matching Artifact Registry's
+		// PackageNamePrefixes exactly. If this were path-aware, a policy
+		// scoped to "a" would delete "ab" while sync left it unprotected.
+		"subpath is a plain string prefix": {districtsJobs + "/a", "ab", true},
 	}
 
 	for label, tc := range cases {

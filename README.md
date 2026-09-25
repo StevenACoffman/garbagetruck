@@ -101,13 +101,72 @@ registry no longer holds means a cluster refers to an image that is already
 gone. And because `protected-digest-only` is one name per image, only one
 digest-pinned version of an image can hold it. The rest are reported.
 
-## Not Implemented Yet
+## Making the Tags Mean Something
 
-**The `protected-` tags do nothing on their own.** They only matter alongside a
-repository cleanup policy that keeps versions whose tags start with
-`protected-`. `garbagetruck` does not install that policy. See
-`artifact_registry_cleanup_policy.md` for the policy this convention is built
-for. Until it is installed, `sync` maintains tags that nothing consults.
+The `protected-` tags do nothing on their own. They matter because a repository
+cleanup policy keeps versions whose tags start with `protected-`.
+`garbagetruck policy` installs that policy, plus the two rules around it:
 
-`garbagetruck` also never deletes an image. Deciding what to delete is the
-cleanup policy's job. Deciding what to spare is this tool's.
+| Rule                          | Action                                                                  |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| `garbagetruck-delete-old`     | Delete versions older than `--delete-older-than` (default 30 days)      |
+| `garbagetruck-keep-recent`    | Keep the `--keep-most-recent` newest versions of each image (default 5) |
+| `garbagetruck-keep-protected` | Keep anything tagged `protected-`                                       |
+
+```console
+$ garbagetruck policy --dry-run \
+    --registry-prefix us-central1-docker.pkg.dev/khan-academy/districts-jobs
+would install garbagetruck-delete-old
+would install garbagetruck-keep-recent
+would install garbagetruck-keep-protected
+```
+
+Artifact Registry evaluates rules against each other with OR, and a keep rule
+always wins over a delete rule, so a version survives if any keep rule matches
+it. The two keep rules stay separate for that reason. Combined into one, a
+version would have to be both recent and protected to survive, and everything
+protected but old would be deleted.
+
+Policies this tool did not write are left in place and reported. A cleanup
+policy of your own that also deletes will delete on top of these rules, so
+`policy` warns when it finds one.
+
+### Order Matters
+
+These rules delete images that carry no `protected-` tag, and only `sync` adds
+those tags. Installing a live policy against a registry `sync` has never
+touched makes every version older than the window a candidate for deletion.
+
+Run `sync` first, or install with `--cleanup-dry-run` and read what the
+registry reports it would have deleted.
+
+### Two Dry Runs
+
+They hold back different things, so they have different names. They can be
+combined.
+
+| Flag                | Holds back                          | Writes to the registry?                            |
+| ------------------- | ----------------------------------- | -------------------------------------------------- |
+| `--dry-run`         | `garbagetruck`                      | No. Prints the plan and stops.                     |
+| `--cleanup-dry-run` | The registry's own cleanup pipeline | Yes. Installs the policies with deletion disabled. |
+
+`--dry-run` means the same thing in every command: `garbagetruck` writes
+nothing.
+
+## Scoping to Part of a Repository
+
+A cleanup policy attaches to a repository. The last segment of
+`us-central1-docker.pkg.dev/khan-academy/districts-jobs` is the repository
+itself, so that prefix is covered whole, and
+`.../districts-jobs/ltv2-to-assessments` along with it.
+
+A prefix with more path than that is confined with the registry's
+`PackageNamePrefixes`, which matches on a plain string prefix rather than a
+path prefix. `sync` matches packages the same way, deliberately: if one were
+path-aware and the other were not, a prefix of `ltv2-` would scope the delete
+rule to `ltv2-extra` while `sync` left that package unprotected.
+
+## What Is Never Done
+
+`garbagetruck` never deletes an image. Deciding what to delete is the cleanup
+policy's job. Deciding what to spare is this tool's.

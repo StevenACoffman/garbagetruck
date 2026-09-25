@@ -16,6 +16,7 @@ import (
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 
+	"github.com/StevenACoffman/garbagetruck/cmd/policy"
 	"github.com/StevenACoffman/garbagetruck/cmd/protected"
 	"github.com/StevenACoffman/garbagetruck/cmd/root"
 	"github.com/StevenACoffman/garbagetruck/cmd/sync"
@@ -32,6 +33,7 @@ import (
 // Flags supplied on the command line always take precedence over env vars.
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	r := root.New(stdin, stdout, stderr)
+	policy.New(r)
 	protected.New(r)
 	sync.New(r)
 	version.New(r)
