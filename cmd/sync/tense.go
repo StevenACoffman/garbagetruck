@@ -10,8 +10,8 @@ type tense struct {
 }
 
 // wouldTense describes a plan that has not been applied.
-func wouldTense() tense {
-	return tense{
+func wouldTense() *tense {
+	return &tense{
 		create:  "would tag",
 		move:    "would move",
 		remove:  "would untag",
@@ -20,8 +20,8 @@ func wouldTense() tense {
 }
 
 // didTense describes a plan that has been applied.
-func didTense() tense {
-	return tense{
+func didTense() *tense {
+	return &tense{
 		create:  "tagged",
 		move:    "moved",
 		remove:  "untagged",

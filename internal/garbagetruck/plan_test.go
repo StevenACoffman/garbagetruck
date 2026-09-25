@@ -3,6 +3,7 @@ package garbagetruck_test
 import (
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 
@@ -11,10 +12,12 @@ import (
 
 const roster = districtsJobs + "/roster"
 
-// version is one stored version in a test fixture: a digest and its tags.
+// version is one stored version in a test fixture: a digest, its tags, and
+// when the registry took it. A zero created means the registry reported none.
 type version struct {
-	digest string
-	tags   []string
+	digest  string
+	tags    []string
+	created time.Time
 }
 
 // image is one registry image in a test fixture, written as the manifests
@@ -29,7 +32,7 @@ func TestPlanProtectionCreatesMissingTags(t *testing.T) {
 
 	plan := garbagetruck.PlanProtection(
 		parseRefs(t, roster+":"+webappTag),
-		images(t, image{roster, []version{{digestA, []string{webappTag}}}}),
+		images(t, image{roster, []version{{digest: digestA, tags: []string{webappTag}}}}),
 	)
 
 	wantCreate := []string{roster + " protected-" + webappTag + " -> " + digestA}
@@ -47,7 +50,7 @@ func TestPlanProtectionLeavesCorrectTagsAlone(t *testing.T) {
 	plan := garbagetruck.PlanProtection(
 		parseRefs(t, roster+":"+webappTag),
 		images(t, image{roster, []version{
-			{digestA, []string{webappTag, "protected-" + webappTag}},
+			{digest: digestA, tags: []string{webappTag, "protected-" + webappTag}},
 		}}),
 	)
 
@@ -65,8 +68,8 @@ func TestPlanProtectionMovesAStaleTag(t *testing.T) {
 	plan := garbagetruck.PlanProtection(
 		parseRefs(t, roster+":"+webappTag),
 		images(t, image{roster, []version{
-			{digestA, []string{"protected-" + webappTag}},
-			{digestB, []string{webappTag}},
+			{digest: digestA, tags: []string{"protected-" + webappTag}},
+			{digest: digestB, tags: []string{webappTag}},
 		}}),
 	)
 
@@ -85,8 +88,8 @@ func TestPlanProtectionRemovesUnearnedTags(t *testing.T) {
 	plan := garbagetruck.PlanProtection(
 		parseRefs(t, roster+":"+webappTag),
 		images(t, image{roster, []version{
-			{digestA, []string{webappTag, "protected-" + webappTag}},
-			{digestB, []string{olderTag, "protected-" + olderTag}},
+			{digest: digestA, tags: []string{webappTag, "protected-" + webappTag}},
+			{digest: digestB, tags: []string{olderTag, "protected-" + olderTag}},
 		}}),
 	)
 
@@ -107,7 +110,7 @@ func TestPlanProtectionNeverTouchesUnprefixedTags(t *testing.T) {
 	plan := garbagetruck.PlanProtection(
 		nil,
 		images(t, image{roster, []version{
-			{digestA, []string{webappTag, "latest", "v1.2.3"}},
+			{digest: digestA, tags: []string{webappTag, "latest", "v1.2.3"}},
 		}}),
 	)
 
@@ -121,7 +124,7 @@ func TestPlanProtectionTagsDigestPinnedReferences(t *testing.T) {
 
 	plan := garbagetruck.PlanProtection(
 		parseRefs(t, roster+"@"+digestA),
-		images(t, image{roster, []version{{digestA, nil}}}),
+		images(t, image{roster, []version{{digest: digestA, tags: nil}}}),
 	)
 
 	want := []string{roster + " " + garbagetruck.DigestOnlyTag + " -> " + digestA}
@@ -137,7 +140,10 @@ func TestPlanProtectionReportsDigestOnlyConflict(t *testing.T) {
 	// "protected-digest-only" name; only one version can carry it.
 	plan := garbagetruck.PlanProtection(
 		parseRefs(t, roster+"@"+digestA, roster+"@"+digestB),
-		images(t, image{roster, []version{{digestA, nil}, {digestB, nil}}}),
+		images(
+			t,
+			image{roster, []version{{digest: digestA, tags: nil}, {digest: digestB, tags: nil}}},
+		),
 	)
 
 	want := []string{roster + " " + garbagetruck.DigestOnlyTag + " -> " + digestA}
@@ -159,7 +165,7 @@ func TestPlanProtectionReportsAMissingVersion(t *testing.T) {
 	// running something that has already been deleted.
 	plan := garbagetruck.PlanProtection(
 		parseRefs(t, roster+":"+webappTag),
-		images(t, image{roster, []version{{digestA, []string{olderTag}}}}),
+		images(t, image{roster, []version{{digest: digestA, tags: []string{olderTag}}}}),
 	)
 
 	if !plan.IsEmpty() {
@@ -177,7 +183,7 @@ func TestPlanProtectionIgnoresImagesOutsideTheRegistry(t *testing.T) {
 	// not be reported as problems.
 	plan := garbagetruck.PlanProtection(
 		parseRefs(t, "alpine:3.20", "cgr.dev/chainguard/kubectl:latest", roster+":"+webappTag),
-		images(t, image{roster, []version{{digestA, []string{webappTag}}}}),
+		images(t, image{roster, []version{{digest: digestA, tags: []string{webappTag}}}}),
 	)
 
 	if len(plan.Problems) != 0 {
@@ -193,10 +199,16 @@ func TestPlanChangesOrdersMovesAndCreatesBeforeRemoves(t *testing.T) {
 
 	plan := garbagetruck.PlanProtection(
 		parseRefs(t, roster+":"+webappTag, roster+":"+olderTag),
-		images(t, image{roster, []version{
-			{digestA, []string{webappTag, "protected-" + olderTag, "protected-stale"}},
-			{digestB, []string{olderTag}},
-		}}),
+		images(t, image{
+			roster,
+			[]version{
+				{
+					digest: digestA,
+					tags:   []string{webappTag, "protected-" + olderTag, "protected-stale"},
+				},
+				{digest: digestB, tags: []string{olderTag}},
+			},
+		}),
 	)
 
 	var kinds []string
@@ -220,18 +232,28 @@ func images(t *testing.T, specs ...image) []garbagetruck.Image {
 
 	built := make([]garbagetruck.Image, 0, len(specs))
 	for _, spec := range specs {
-		repo, err := name.NewRepository(spec.name, name.WithDefaultRegistry(""))
-		if err != nil {
-			t.Fatalf("NewRepository(%q): %v", spec.name, err)
-		}
 		versions := make([]garbagetruck.Version, 0, len(spec.versions))
 		for _, v := range spec.versions {
-			versions = append(versions,
-				garbagetruck.Version{Digest: v.digest, Tags: v.tags})
+			versions = append(versions, garbagetruck.Version{
+				Digest: v.digest, Tags: v.tags, Created: v.created,
+			})
 		}
-		built = append(built, garbagetruck.Image{Repo: repo, Versions: versions})
+		built = append(built, garbagetruck.Image{
+			Repo: repo(t, spec.name), Versions: versions,
+		})
 	}
 	return built
+}
+
+// repo parses an image name the way the domain does.
+func repo(t *testing.T, image string) name.Repository {
+	t.Helper()
+
+	parsed, err := name.NewRepository(image, name.WithDefaultRegistry(""))
+	if err != nil {
+		t.Fatalf("NewRepository(%q): %v", image, err)
+	}
+	return parsed
 }
 
 // changeStrings renders changes so a failure names them instead of printing

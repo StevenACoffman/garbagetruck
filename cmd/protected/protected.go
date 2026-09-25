@@ -98,6 +98,7 @@ func (cfg *Config) exec(ctx context.Context, _ []string) error {
 // report clones the manifest repository, collects the images it declares to be
 // in use, and writes them out.
 func (cfg *Config) report(ctx context.Context) error {
+	cfg.Progressf("cloning %s", cfg.Repo)
 	worktree, err := gitops.Clone(ctx, gitops.Source{
 		Repo:   cfg.Repo,
 		Branch: cfg.Branch,
@@ -112,6 +113,7 @@ func (cfg *Config) report(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("protected: %s: %w", cfg.Repo, err)
 	}
+	cfg.Progressf("read %d image references from the manifests", len(refs))
 
 	if err := cfg.write(refs.ByImage()); err != nil {
 		return fmt.Errorf("protected: %w", err)

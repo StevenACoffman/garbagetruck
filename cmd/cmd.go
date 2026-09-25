@@ -19,6 +19,7 @@ import (
 	"github.com/StevenACoffman/garbagetruck/cmd/policy"
 	"github.com/StevenACoffman/garbagetruck/cmd/protected"
 	"github.com/StevenACoffman/garbagetruck/cmd/root"
+	"github.com/StevenACoffman/garbagetruck/cmd/sweep"
 	"github.com/StevenACoffman/garbagetruck/cmd/sync"
 	"github.com/StevenACoffman/garbagetruck/cmd/version"
 )
@@ -35,6 +36,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	r := root.New(stdin, stdout, stderr)
 	policy.New(r)
 	protected.New(r)
+	sweep.New(r)
 	sync.New(r)
 	version.New(r)
 	// register new commands here

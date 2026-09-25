@@ -26,12 +26,16 @@ func TestPrefixPolicies(t *testing.T) {
 		KeepMostRecent:  5,
 	})
 
-	want := []string{registry.DeleteOldID, registry.KeepProtectedID, registry.KeepRecentID}
+	want := []string{
+		scoped(t, registry.DeleteOldID),
+		scoped(t, registry.KeepProtectedID),
+		scoped(t, registry.KeepRecentID),
+	}
 	if got := ids(policies); !slices.Equal(got, want) {
 		t.Fatalf("policy ids = %v, want %v", got, want)
 	}
 
-	del := policies[registry.DeleteOldID]
+	del := policies[scoped(t, registry.DeleteOldID)]
 	if del.GetAction() != artifactregistrypb.CleanupPolicy_DELETE {
 		t.Errorf("%s action = %v, want DELETE", registry.DeleteOldID, del.GetAction())
 	}
@@ -39,7 +43,7 @@ func TestPrefixPolicies(t *testing.T) {
 		t.Errorf("%s OlderThan = %v, want %v", registry.DeleteOldID, got, thirtyDays)
 	}
 
-	recent := policies[registry.KeepRecentID]
+	recent := policies[scoped(t, registry.KeepRecentID)]
 	if recent.GetAction() != artifactregistrypb.CleanupPolicy_KEEP {
 		t.Errorf("%s action = %v, want KEEP", registry.KeepRecentID, recent.GetAction())
 	}
@@ -47,7 +51,7 @@ func TestPrefixPolicies(t *testing.T) {
 		t.Errorf("%s KeepCount = %d, want 5", registry.KeepRecentID, got)
 	}
 
-	protected := policies[registry.KeepProtectedID]
+	protected := policies[scoped(t, registry.KeepProtectedID)]
 	if protected.GetAction() != artifactregistrypb.CleanupPolicy_KEEP {
 		t.Errorf("%s action = %v, want KEEP", registry.KeepProtectedID, protected.GetAction())
 	}
@@ -70,14 +74,14 @@ func TestPrefixPoliciesKeepRulesStaySeparate(t *testing.T) {
 	}
 	policies := prefix.Policies(registry.PolicySpec{DeleteOlderThan: thirtyDays, KeepMostRecent: 5})
 
-	recent := policies[registry.KeepRecentID].GetCondition()
+	recent := policies[scoped(t, registry.KeepRecentID)].GetCondition()
 	if recent.GetTagPrefixes() != nil {
 		t.Errorf(
 			"the keep-recent rule must not also constrain tags, got %v",
 			recent.GetTagPrefixes(),
 		)
 	}
-	if policies[registry.KeepProtectedID].GetMostRecentVersions() != nil {
+	if policies[scoped(t, registry.KeepProtectedID)].GetMostRecentVersions() != nil {
 		t.Error("the keep-protected rule must not also constrain version count")
 	}
 }
@@ -126,7 +130,11 @@ func TestPlanPoliciesOnAnEmptyRepository(t *testing.T) {
 	managed := managedPolicies(t)
 	plan := registry.PlanPolicies(registry.Policies{}, managed, false)
 
-	want := []string{registry.DeleteOldID, registry.KeepProtectedID, registry.KeepRecentID}
+	want := []string{
+		scoped(t, registry.DeleteOldID),
+		scoped(t, registry.KeepProtectedID),
+		scoped(t, registry.KeepRecentID),
+	}
 	if got := plan.Create; !slices.Equal(got, want) {
 		t.Errorf("Create = %v, want %v", got, want)
 	}
@@ -168,8 +176,8 @@ func TestPlanPoliciesUpdatesAChangedRule(t *testing.T) {
 	)
 
 	plan := registry.PlanPolicies(current, wider, false)
-	if got := plan.Update; !slices.Equal(got, []string{registry.DeleteOldID}) {
-		t.Errorf("Update = %v, want just %s", got, registry.DeleteOldID)
+	if want := []string{scoped(t, registry.DeleteOldID)}; !slices.Equal(plan.Update, want) {
+		t.Errorf("Update = %v, want %v", plan.Update, want)
 	}
 	if len(plan.Unchanged) != 2 {
 		t.Errorf("Unchanged = %v, want the two keep rules", plan.Unchanged)
@@ -250,6 +258,18 @@ func TestPlanPoliciesTracksTheCleanupDryRunSetting(t *testing.T) {
 	}
 }
 
+// scoped returns the policy id the test prefix qualifies base into, so the
+// tests track the naming scheme instead of restating it.
+func scoped(t *testing.T, base string) string {
+	t.Helper()
+
+	parsed, err := registry.ParsePrefix(districtsJobs)
+	if err != nil {
+		t.Fatalf("ParsePrefix(%q): %v", districtsJobs, err)
+	}
+	return parsed.PolicyID(base)
+}
+
 // managedPolicies builds the rules garbagetruck maintains for the test prefix.
 func managedPolicies(t *testing.T) map[string]*artifactregistrypb.CleanupPolicy {
 	t.Helper()
@@ -278,4 +298,54 @@ func ids(policies map[string]*artifactregistrypb.CleanupPolicy) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+func TestPlanPoliciesIgnoresServerPopulatedTagState(t *testing.T) {
+	t.Parallel()
+
+	// Artifact Registry echoes tag_state back as TAG_STATE_UNSPECIFIED on
+	// every condition it stores, where garbagetruck sends the field unset.
+	// proto.Equal distinguishes those, so without normalization every run
+	// reports the two condition-based policies as needing an update, rewrites
+	// them for no effect, and never converges. Observed against a live
+	// repository; this pins the fix.
+	stored := registry.Policies{ByID: managedPolicies(t)}
+	for _, policy := range stored.ByID {
+		if condition := policy.GetCondition(); condition != nil {
+			condition.TagState = artifactregistrypb.
+				CleanupPolicyCondition_TAG_STATE_UNSPECIFIED.Enum()
+		}
+	}
+
+	plan := registry.PlanPolicies(stored, managedPolicies(t), false)
+	if !plan.IsEmpty() {
+		t.Errorf("re-running against an unchanged repository must change nothing, got %+v", plan)
+	}
+	if len(plan.Unchanged) != 3 {
+		t.Errorf("Unchanged = %v, want all three", plan.Unchanged)
+	}
+}
+
+func TestPlanPoliciesKeepsAnotherPrefixesScopedPolicies(t *testing.T) {
+	t.Parallel()
+
+	// A scoped id from a different prefix on the same repository belongs to
+	// that prefix. garbagetruck must carry it through rather than treat every
+	// "garbagetruck-" id as its own, which would break the case scoping
+	// exists to support.
+	other := "garbagetruck-delete-old-districts-jobs-ltv2"
+	current := registry.Policies{
+		ByID: map[string]*artifactregistrypb.CleanupPolicy{
+			other: {Id: other, Action: artifactregistrypb.CleanupPolicy_DELETE},
+		},
+	}
+
+	plan := registry.PlanPolicies(current, managedPolicies(t), false)
+
+	if got := plan.Preserved; !slices.Equal(got, []string{other}) {
+		t.Errorf("Preserved = %v, want %v", got, []string{other})
+	}
+	if _, kept := plan.Want.ByID[other]; !kept {
+		t.Error("another prefix's policy must survive into what gets written")
+	}
 }

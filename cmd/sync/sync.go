@@ -120,21 +120,27 @@ func (cfg *Config) run(ctx context.Context) error {
 	}
 	defer func() { _ = client.Close() }()
 
-	images, err := client.List(ctx, prefix)
+	// Listing is the slow half of a run: one version listing per package,
+	// over a network. Say so, and count them off.
+	cfg.Progressf("listing images under %s", cfg.Prefix)
+	images, err := client.List(ctx, prefix, cfg.step)
 	if err != nil {
 		return fmt.Errorf("sync: %w", err)
 	}
+	cfg.Progressf("found %d images holding %d versions", len(images), versionCount(images))
 
 	plan := garbagetruck.PlanProtection(manifest, images)
 	if cfg.DryRun {
 		// The registry is never written because Apply — the only function
 		// that writes — is never called. Nothing below this line knows or
 		// needs to know that this was a dry run.
+		cfg.Progressf("planned %d changes, writing nothing (--dry-run)", len(plan.Changes()))
 		cfg.report(&plan, wouldTense())
 		return nil
 	}
 
-	applied, err := client.Apply(ctx, prefix, &plan)
+	cfg.Progressf("applying %d changes", len(plan.Changes()))
+	applied, err := client.Apply(ctx, prefix, &plan, cfg.step)
 	cfg.report(&applied, didTense())
 	if err != nil {
 		return fmt.Errorf("sync: %w", err)
@@ -145,6 +151,7 @@ func (cfg *Config) run(ctx context.Context) error {
 // readManifests clones the GitOps repository and collects the image references
 // it declares to be in use.
 func (cfg *Config) readManifests(ctx context.Context) (garbagetruck.Refs, error) {
+	cfg.Progressf("cloning %s", cfg.Repo)
 	worktree, err := gitops.Clone(ctx, gitops.Source{
 		Repo:   cfg.Repo,
 		Branch: cfg.Branch,
@@ -159,16 +166,32 @@ func (cfg *Config) readManifests(ctx context.Context) (garbagetruck.Refs, error)
 	if err != nil {
 		return nil, fmt.Errorf("sync: %s: %w", cfg.Repo, err)
 	}
+	cfg.Progressf("read %d image references from the manifests", len(refs))
 	return refs, nil
+}
+
+// step reports one item of a long operation. It satisfies registry.Progress.
+func (cfg *Config) step(done, total int, item string) {
+	cfg.Progressf("  [%d/%d] %s", done, total, item)
+}
+
+// versionCount totals the versions across images, so the listing summary says
+// how much was actually read rather than only how many images were touched.
+func versionCount(images []garbagetruck.Image) int {
+	total := 0
+	for _, image := range images {
+		total += len(image.Versions)
+	}
+	return total
 }
 
 // report writes the plan in the given tense. A dry run and a real run print
 // the same shape, because they are the same data: what would change, and what
 // did.
-func (cfg *Config) report(plan *garbagetruck.Plan, tense tense) {
-	writeChanges(cfg.Stdout, tense.create, plan.Create)
-	writeChanges(cfg.Stdout, tense.move, plan.Move)
-	writeChanges(cfg.Stdout, tense.remove, plan.Remove)
+func (cfg *Config) report(plan *garbagetruck.Plan, wording *tense) {
+	writeChanges(cfg.Stdout, wording.create, plan.Create)
+	writeChanges(cfg.Stdout, wording.move, plan.Move)
+	writeChanges(cfg.Stdout, wording.remove, plan.Remove)
 
 	for _, problem := range plan.Problems {
 		_, _ = fmt.Fprintf(cfg.Stdout, "unprotected %s: %s\n", problem.Ref, problem.Reason)
@@ -176,7 +199,7 @@ func (cfg *Config) report(plan *garbagetruck.Plan, tense tense) {
 	// Say "nothing to do" only when that is the whole story. Printing it under
 	// a list of unprotected images would contradict the lines above it.
 	if plan.IsEmpty() && len(plan.Problems) == 0 {
-		_, _ = fmt.Fprintln(cfg.Stdout, tense.nothing)
+		_, _ = fmt.Fprintln(cfg.Stdout, wording.nothing)
 	}
 }
 

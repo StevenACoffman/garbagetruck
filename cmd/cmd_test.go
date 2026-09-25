@@ -60,13 +60,38 @@ func TestRun(t *testing.T) {
 			},
 			wantErrText: "policy: --keep-most-recent must be between 0 and",
 		},
+		"sweep is registered and documents its flags": {
+			args:    []string{"sweep", "--help"},
+			wantErr: ff.ErrHelp,
+			wantOutput: []string{
+				"registry-prefix", "delete-older-than", "keep-most-recent", "dry-run",
+				"yes", "CANNOT BE UNDONE",
+			},
+		},
+		"sweep refuses to run without a registry prefix": {
+			// --yes is present so this pins the prefix check specifically,
+			// rather than passing for the wrong reason.
+			args:        []string{"sweep", "--yes"},
+			wantErrText: "sweep: --registry-prefix is required",
+		},
+		"sweep refuses to delete without --yes": {
+			args:        []string{"sweep", "-p", "us-central1-docker.pkg.dev/p/r"},
+			wantErrText: "sweep: --yes is required to delete",
+		},
+		"sweep rejects a non-positive retention window": {
+			args: []string{
+				"sweep", "--yes", "-p", "us-central1-docker.pkg.dev/p/r",
+				"--delete-older-than", "0s",
+			},
+			wantErrText: "sweep: --delete-older-than must be positive",
+		},
 		"no subcommand is not a failure": {
 			args:    nil,
 			wantErr: ff.ErrNoExec,
 		},
 		"an unknown subcommand is named back": {
-			args:        []string{"sweep"},
-			wantErrText: `unknown subcommand "sweep"`,
+			args:        []string{"frobnicate"},
+			wantErrText: `unknown subcommand "frobnicate"`,
 		},
 		"version writes to the injected stdout": {
 			args:       []string{"version"},

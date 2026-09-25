@@ -3,6 +3,8 @@
 package registry
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,6 +20,15 @@ const (
 	// minPrefixParts is host, project, and repository — the shortest prefix
 	// that names an Artifact Registry repository.
 	minPrefixParts = 3
+
+	// maxPolicyID is the longest a cleanup policy id may be. The API says
+	// they "must unique within a repository and be under 128 characters in
+	// length", so 127 is the last usable length.
+	maxPolicyID = 127
+
+	// policyIDDigest is how many hex characters of a scope's digest are kept
+	// when a qualified id has to be shortened.
+	policyIDDigest = 8
 )
 
 // ErrBadPrefix is returned for a prefix that does not name an Artifact
@@ -113,6 +124,60 @@ func (p Prefix) Package(repo name.Repository) (string, error) {
 		return "", fmt.Errorf("%q: %w: not in %s", repo.Name(), ErrBadPrefix, p.Parent())
 	}
 	return pkg, nil
+}
+
+// PolicyID qualifies a cleanup policy id with the part of this prefix after
+// the project, so that two prefixes do not overwrite each other's rules.
+//
+// Policy ids only have to be unique within a repository, so two different
+// repositories never collide however they are named. What does collide is two
+// prefixes that share a repository and differ only by subpath: without the
+// scope both would write "garbagetruck-delete-old" to the same repository and
+// the second would silently replace the first. The scope also makes a rule
+// self-describing when someone reads the repository's policies directly.
+func (p Prefix) PolicyID(base string) string {
+	scope := p.Repository
+	if p.Subpath != "" {
+		scope += "/" + p.Subpath
+	}
+	return joinPolicyID(base, scopeSlug(scope))
+}
+
+// joinPolicyID joins a base id to a scope within the length the API allows.
+func joinPolicyID(base, scope string) string {
+	id := base + "-" + scope
+	if len(id) <= maxPolicyID {
+		return id
+	}
+	// Truncating alone would let two long scopes collide, which is the one
+	// thing the scope exists to prevent, so carry a digest of the whole scope.
+	sum := sha256.Sum256([]byte(scope))
+	digest := hex.EncodeToString(sum[:])[:policyIDDigest]
+	room := maxPolicyID - len(base) - len(digest) - 2 // two joining hyphens
+	if room < 0 {
+		room = 0
+	}
+	return base + "-" + scope[:min(room, len(scope))] + "-" + digest
+}
+
+// scopeSlug reduces a repository-and-subpath to characters that are safe in
+// an id. No character set is documented for policy ids, so this keeps to the
+// one Artifact Registry repository names already use.
+func scopeSlug(scope string) string {
+	slug := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r - 'A' + 'a'
+		default:
+			return '-'
+		}
+	}, scope)
+	for strings.Contains(slug, "--") {
+		slug = strings.ReplaceAll(slug, "--", "-")
+	}
+	return strings.Trim(slug, "-")
 }
 
 // packageName is the Artifact Registry resource name of one package. The API

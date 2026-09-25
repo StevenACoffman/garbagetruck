@@ -159,52 +159,59 @@ func (cfg *Config) run(ctx context.Context, spec registry.PolicySpec) error {
 	}
 	defer func() { _ = client.Close() }()
 
+	cfg.Progressf("reading cleanup policies on %s", prefix.Parent())
 	current, err := client.ReadPolicies(ctx, prefix)
 	if err != nil {
 		return fmt.Errorf("policy: %w", err)
 	}
+	cfg.Progressf("repository has %d cleanup policies", len(current.ByID))
 
 	plan := registry.PlanPolicies(current, prefix.Policies(spec), spec.CleanupDryRun)
 
 	if cfg.DryRun {
 		// Nothing is written because WritePolicies, the only function here
 		// that writes, is never called.
-		cfg.report(&plan, "would ")
+		cfg.report(&plan, wouldTense())
 		return nil
 	}
+	if plan.IsEmpty() {
+		// Writing an identical repository would be a no-op with an audit-log
+		// entry and a wasted call, and it would make "nothing written" false.
+		cfg.report(&plan, didTense())
+		return nil
+	}
+	cfg.Progressf("writing %d cleanup policies", len(plan.Want.ByID))
 	if err := client.WritePolicies(ctx, prefix, plan.Want); err != nil {
 		return fmt.Errorf("policy: %w", err)
 	}
-	cfg.report(&plan, "")
+	cfg.report(&plan, didTense())
 	return nil
 }
 
-// report writes the plan. The only difference between describing a change and
-// reporting one already made is the word in front of the verb.
-func (cfg *Config) report(plan *registry.PolicyPlan, mood string) {
+// report writes the plan in the given tense: what would change, or what did.
+func (cfg *Config) report(plan *registry.PolicyPlan, wording *tense) {
 	for _, id := range plan.Create {
-		_, _ = fmt.Fprintf(cfg.Stdout, "%sinstall %s\n", mood, id)
+		_, _ = fmt.Fprintf(cfg.Stdout, "%s %s\n", wording.install, id)
 	}
 	for _, id := range plan.Update {
-		_, _ = fmt.Fprintf(cfg.Stdout, "%supdate %s\n", mood, id)
+		_, _ = fmt.Fprintf(cfg.Stdout, "%s %s\n", wording.update, id)
 	}
 	if plan.DryRunFrom != plan.DryRunTo {
-		_, _ = fmt.Fprintf(cfg.Stdout, "%sturn the registry cleanup pipeline %s\n",
-			mood, onOff(plan.DryRunTo))
+		_, _ = fmt.Fprintf(cfg.Stdout, "%s %s\n", wording.pipeline, onOff(plan.DryRunTo))
 	}
 	for _, id := range plan.Unchanged {
-		_, _ = fmt.Fprintf(cfg.Stdout, "leave %s as it is\n", id)
+		_, _ = fmt.Fprintf(cfg.Stdout, "%s %s as it is\n", wording.unchanged, id)
 	}
 	if len(plan.Preserved) > 0 {
-		_, _ = fmt.Fprintf(cfg.Stdout, "keep %d policy garbagetruck does not manage: %s\n",
-			len(plan.Preserved), strings.Join(plan.Preserved, ", "))
+		_, _ = fmt.Fprintf(cfg.Stdout, "%s %d policy garbagetruck does not manage: %s\n",
+			wording.preserved, len(plan.Preserved), strings.Join(plan.Preserved, ", "))
 	}
 	for _, id := range plan.ForeignDeletes {
 		_, _ = fmt.Fprintf(cfg.Stderr,
 			"warning: %s also deletes, on top of %s\n", id, registry.DeleteOldID)
 	}
 	if plan.IsEmpty() {
-		_, _ = fmt.Fprintln(cfg.Stdout, "cleanup policies already match")
+		_, _ = fmt.Fprintln(cfg.Stdout, wording.nothing)
 	}
 }
 

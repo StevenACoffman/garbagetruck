@@ -11,6 +11,7 @@ import (
 
 	artifactregistry "cloud.google.com/go/artifactregistry/apiv1"
 	"cloud.google.com/go/artifactregistry/apiv1/artifactregistrypb"
+	"github.com/google/go-containerregistry/pkg/name"
 	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
@@ -29,6 +30,25 @@ const (
 	retryInitial = 250 * time.Millisecond
 	retryMax     = 10 * time.Second
 )
+
+// deleteBatch bounds one BatchDeleteVersions call. The service caps the batch
+// size itself and does not document the number, so this stays well under any
+// plausible limit and keeps progress reporting granular.
+const deleteBatch = 200
+
+// Progress is called as a long operation advances: how many of how many
+// items are done, and the name of the one just handled. A nil Progress
+// reports nothing, which is what lets a caller opt out without every call
+// site having to supply one.
+type Progress func(done, total int, item string)
+
+// packageRef is one Artifact Registry package under a prefix, resolved once
+// so that listing can report how many there are before it starts.
+type packageRef struct {
+	id       string
+	resource string
+	repo     name.Repository
+}
 
 // Client reads and edits the Docker images an Artifact Registry repository
 // holds. Close it when done.
@@ -69,26 +89,27 @@ func (c *Client) Close() error {
 // List returns every image under prefix, each with the versions the registry
 // stores for it: the digest that identifies the content, and the tags pointing
 // at it. Results are sorted by image name so runs are comparable.
-func (c *Client) List(ctx context.Context, prefix Prefix) ([]garbagetruck.Image, error) {
-	var images []garbagetruck.Image
-	request := &artifactregistrypb.ListPackagesRequest{Parent: prefix.Parent()}
-	for pkg, err := range c.ar.ListPackages(ctx, request, retryReads()).All() {
-		if err != nil {
-			return nil, fmt.Errorf("list packages in %s: %w", prefix.Parent(), err)
-		}
-		id, named := resourceID(pkg.GetName(), "/packages/")
-		if !named || !prefix.Matches(id) {
-			continue
-		}
-		repo, repoErr := prefix.Repo(id)
-		if repoErr != nil {
-			return nil, repoErr
-		}
-		versions, listErr := c.listVersions(ctx, pkg.GetName())
+func (c *Client) List(
+	ctx context.Context,
+	prefix Prefix,
+	onProgress Progress,
+) ([]garbagetruck.Image, error) {
+	// Enumerate the packages before listing any versions. It costs one
+	// paginated call and turns an open-ended wait into a countable one: this
+	// is the slow half of a run, one version listing per package.
+	packages, err := c.packages(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	images := make([]garbagetruck.Image, 0, len(packages))
+	for i, pkg := range packages {
+		onProgress.report(i+1, len(packages), pkg.id)
+		versions, listErr := c.listVersions(ctx, pkg.resource)
 		if listErr != nil {
 			return nil, listErr
 		}
-		images = append(images, garbagetruck.Image{Repo: repo, Versions: versions})
+		images = append(images, garbagetruck.Image{Repo: pkg.repo, Versions: versions})
 	}
 	slices.SortFunc(images, func(a, b garbagetruck.Image) int {
 		return strings.Compare(a.Repo.Name(), b.Repo.Name())
@@ -109,6 +130,7 @@ func (c *Client) Apply(
 	ctx context.Context,
 	prefix Prefix,
 	plan *garbagetruck.Plan,
+	onProgress Progress,
 ) (garbagetruck.Plan, error) {
 	applied := garbagetruck.Plan{Problems: plan.Problems}
 	// Ordered deliberately: a Move repoints an existing tag atomically, so
@@ -124,8 +146,11 @@ func (c *Client) Apply(
 	}
 
 	var errs []error
+	total, seen := len(plan.Changes()), 0
 	for _, step := range steps {
 		for _, change := range step.changes {
+			seen++
+			onProgress.report(seen, total, change.Tag+" on "+change.Repo.Name())
 			if err := step.do(ctx, prefix, change); err != nil {
 				errs = append(errs, err)
 				continue
@@ -175,6 +200,106 @@ func (c *Client) WritePolicies(ctx context.Context, prefix Prefix, want Policies
 	return nil
 }
 
+// DeleteVersions permanently removes the given versions.
+//
+// This is the only irreversible operation in garbagetruck: a deleted version
+// cannot be restored, and any tag pointing at it goes with it. Callers are
+// expected to have computed expired with garbagetruck.PlanSweep, which spares
+// anything carrying a protected tag.
+//
+// Deletions go in batches under one repository parent. A batch that fails is
+// recorded and the rest continue, because stopping halfway through would leave
+// the registry in a state no one chose; the returned error joins every
+// failure. The count returned is of versions actually deleted.
+func (c *Client) DeleteVersions(
+	ctx context.Context,
+	prefix Prefix,
+	expired []garbagetruck.Expired,
+	onProgress Progress,
+) (int, error) {
+	names, err := versionNames(prefix, expired)
+	if err != nil {
+		return 0, err
+	}
+
+	var (
+		deleted int
+		errs    []error
+	)
+	for start := 0; start < len(names); start += deleteBatch {
+		batch := names[start:min(start+deleteBatch, len(names))]
+		onProgress.report(start+len(batch), len(names), "deleting")
+		if err := c.deleteBatch(ctx, prefix, batch); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		deleted += len(batch)
+	}
+	return deleted, errors.Join(errs...)
+}
+
+// deleteBatch removes one batch and waits for the registry to finish, so that
+// a failure is reported against the batch that caused it rather than surfacing
+// long afterwards.
+func (c *Client) deleteBatch(ctx context.Context, prefix Prefix, names []string) error {
+	op, err := c.ar.BatchDeleteVersions(ctx, &artifactregistrypb.BatchDeleteVersionsRequest{
+		Parent: prefix.Parent(),
+		Names:  names,
+	})
+	if err != nil {
+		return fmt.Errorf("delete %d versions: %w", len(names), err)
+	}
+	if err := op.Wait(ctx); err != nil {
+		return fmt.Errorf("delete %d versions: %w", len(names), err)
+	}
+	return nil
+}
+
+// versionNames maps expired versions onto Artifact Registry resource names,
+// failing as a whole if any of them falls outside prefix. A mismatch means
+// the caller and this client disagree about what is being swept, which is not
+// a thing to discover halfway through a deletion.
+func versionNames(prefix Prefix, expired []garbagetruck.Expired) ([]string, error) {
+	names := make([]string, 0, len(expired))
+	for i := range expired {
+		pkg, err := prefix.Package(expired[i].Repo)
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, prefix.versionName(pkg, expired[i].Digest))
+	}
+	return names, nil
+}
+
+// packages resolves every package under prefix, so a caller knows how much
+// work there is before the per-package listing begins.
+func (c *Client) packages(ctx context.Context, prefix Prefix) ([]packageRef, error) {
+	var found []packageRef
+	request := &artifactregistrypb.ListPackagesRequest{Parent: prefix.Parent()}
+	for pkg, err := range c.ar.ListPackages(ctx, request, retryReads()).All() {
+		if err != nil {
+			return nil, fmt.Errorf("list packages in %s: %w", prefix.Parent(), err)
+		}
+		id, named := resourceID(pkg.GetName(), "/packages/")
+		if !named || !prefix.Matches(id) {
+			continue
+		}
+		repo, repoErr := prefix.Repo(id)
+		if repoErr != nil {
+			return nil, repoErr
+		}
+		found = append(found, packageRef{id: id, resource: pkg.GetName(), repo: repo})
+	}
+	return found, nil
+}
+
+// report calls p unless it is nil, so callers need no nil check of their own.
+func (p Progress) report(done, total int, item string) {
+	if p != nil {
+		p(done, total, item)
+	}
+}
+
 // listVersions reads one package's versions. VersionView_FULL is what makes
 // the response carry RelatedTags, which saves a ListTags call per package.
 func (c *Client) listVersions(ctx context.Context, pkg string) ([]garbagetruck.Version, error) {
@@ -194,6 +319,10 @@ func (c *Client) listVersions(ctx context.Context, pkg string) ([]garbagetruck.V
 		versions = append(versions, garbagetruck.Version{
 			Digest: digest,
 			Tags:   tagIDs(version.GetRelatedTags()),
+			// GetCreateTime returns nil when the registry reports none, and
+			// AsTime maps that to the zero time, which retention treats as
+			// "age unknown, never delete".
+			Created: version.GetCreateTime().AsTime(),
 		})
 	}
 	return versions, nil

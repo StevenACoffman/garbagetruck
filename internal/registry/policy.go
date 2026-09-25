@@ -12,16 +12,17 @@ import (
 )
 
 const (
-	// DeleteOldID names the rule that expires versions. The id deliberately
-	// does not mention a duration: an id of "delete-after-30-days" becomes a
-	// lie the moment the duration is configured to anything else.
+	// DeleteOldID is the base id of the rule that expires versions. The id
+	// deliberately does not mention a duration: an id of
+	// "delete-after-30-days" becomes a lie the moment the duration is
+	// configured to anything else. Prefix.PolicyID appends the prefix scope.
 	DeleteOldID = "garbagetruck-delete-old"
-	// KeepRecentID names the rule that spares the newest versions of an image
-	// however old they are, so an image that stopped being rebuilt does not
-	// vanish entirely.
+	// KeepRecentID is the base id of the rule that spares the newest versions
+	// of an image however old they are, so an image that stopped being
+	// rebuilt does not vanish entirely.
 	KeepRecentID = "garbagetruck-keep-recent"
-	// KeepProtectedID names the rule that spares whatever garbagetruck sync
-	// has tagged. It is the rule that gives the protected- tags their meaning.
+	// KeepProtectedID is the base id of the rule that spares whatever
+	// garbagetruck sync has tagged. It gives the protected- tags their meaning.
 	KeepProtectedID = "garbagetruck-keep-protected"
 )
 
@@ -110,7 +111,7 @@ func PlanPolicies(
 		switch existing, present := current.ByID[id]; {
 		case !present:
 			plan.Create = append(plan.Create, id)
-		case !proto.Equal(existing, policy):
+		case !proto.Equal(canonical(existing), canonical(policy)):
 			plan.Update = append(plan.Update, id)
 		default:
 			plan.Unchanged = append(plan.Unchanged, id)
@@ -130,9 +131,11 @@ func PlanPolicies(
 // everything protected but old, which is exactly what must survive.
 func (p Prefix) Policies(spec PolicySpec) map[string]*artifactregistrypb.CleanupPolicy {
 	scope := p.scope()
+	deleteOld, keepRecent, keepProtected :=
+		p.PolicyID(DeleteOldID), p.PolicyID(KeepRecentID), p.PolicyID(KeepProtectedID)
 	return map[string]*artifactregistrypb.CleanupPolicy{
-		DeleteOldID: {
-			Id:     DeleteOldID,
+		deleteOld: {
+			Id:     deleteOld,
 			Action: artifactregistrypb.CleanupPolicy_DELETE,
 			ConditionType: &artifactregistrypb.CleanupPolicy_Condition{
 				Condition: &artifactregistrypb.CleanupPolicyCondition{
@@ -141,8 +144,8 @@ func (p Prefix) Policies(spec PolicySpec) map[string]*artifactregistrypb.Cleanup
 				},
 			},
 		},
-		KeepRecentID: {
-			Id:     KeepRecentID,
+		keepRecent: {
+			Id:     keepRecent,
 			Action: artifactregistrypb.CleanupPolicy_KEEP,
 			ConditionType: &artifactregistrypb.CleanupPolicy_MostRecentVersions{
 				MostRecentVersions: &artifactregistrypb.CleanupPolicyMostRecentVersions{
@@ -151,8 +154,8 @@ func (p Prefix) Policies(spec PolicySpec) map[string]*artifactregistrypb.Cleanup
 				},
 			},
 		},
-		KeepProtectedID: {
-			Id:     KeepProtectedID,
+		keepProtected: {
+			Id:     keepProtected,
 			Action: artifactregistrypb.CleanupPolicy_KEEP,
 			ConditionType: &artifactregistrypb.CleanupPolicy_Condition{
 				Condition: &artifactregistrypb.CleanupPolicyCondition{
@@ -188,4 +191,29 @@ func (p Prefix) scope() []string {
 		return nil
 	}
 	return []string{p.Subpath}
+}
+
+// canonical returns a copy of policy with the fields Artifact Registry fills
+// in on read but that carry no meaning, so a stored policy and a freshly built
+// one compare equal when they say the same thing.
+//
+// The registry echoes tag_state back as TAG_STATE_UNSPECIFIED on every
+// condition it stores. That is an explicitly set zero, which proto.Equal
+// rightly distinguishes from the unset field garbagetruck sends. Without this,
+// every run reports the two condition-based policies as needing an update and
+// rewrites them to no effect, which both never converges and drowns out a real
+// drift. mostRecentVersions has no such field, which is why only two of the
+// three ever differed.
+func canonical(policy *artifactregistrypb.CleanupPolicy) *artifactregistrypb.CleanupPolicy {
+	clone, ok := proto.Clone(policy).(*artifactregistrypb.CleanupPolicy)
+	if !ok {
+		return policy
+	}
+	// GetTagState reports the zero for both an unset and an explicitly zero
+	// field, so this normalizes the two spellings onto the unset one.
+	if condition := clone.GetCondition(); condition != nil &&
+		condition.GetTagState() == artifactregistrypb.CleanupPolicyCondition_TAG_STATE_UNSPECIFIED {
+		condition.TagState = nil
+	}
+	return clone
 }

@@ -26,6 +26,16 @@ type Config struct {
 
 func (e ExitError) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
 
+// Progressf writes one line of progress to stderr.
+//
+// Progress goes to stderr, never stdout, so that a command's real output
+// stays machine-readable: "sync --json | jq" must not have step counters
+// mixed into it. Commands share this through the embedded *root.Config so
+// they all report progress the same way.
+func (c *Config) Progressf(format string, args ...any) {
+	_, _ = fmt.Fprintf(c.Stderr, format+"\n", args...)
+}
+
 // New returns a new root Config with the given I/O writers.
 func New(stdin io.Reader, stdout, stderr io.Writer) *Config {
 	var cfg Config

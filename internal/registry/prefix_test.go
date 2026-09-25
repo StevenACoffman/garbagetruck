@@ -2,6 +2,7 @@ package registry_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -224,5 +225,102 @@ func TestPrefixPackageRejectsForeignImages(t *testing.T) {
 				t.Errorf("Package(%q) = %q, %v; want ErrBadPrefix", image, got, err)
 			}
 		})
+	}
+}
+
+func TestPrefixPolicyID(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		prefix string
+		want   string
+	}{
+		"repository": {districtsJobs, "garbagetruck-delete-old-districts-jobs"},
+		"subpath": {
+			districtsJobs + "/ltv2-", "garbagetruck-delete-old-districts-jobs-ltv2",
+		},
+		"nested subpath": {
+			districtsJobs + "/a/b", "garbagetruck-delete-old-districts-jobs-a-b",
+		},
+		"another repository": {
+			"us-central1-docker.pkg.dev/khan-academy/webapp",
+			"garbagetruck-delete-old-webapp",
+		},
+		"underscores and case become hyphens": {
+			"us-central1-docker.pkg.dev/p/Repo_One",
+			"garbagetruck-delete-old-repo-one",
+		},
+	}
+
+	for label, tc := range cases {
+		t.Run(label, func(t *testing.T) {
+			t.Parallel()
+
+			prefix, err := registry.ParsePrefix(tc.prefix)
+			if err != nil {
+				t.Fatalf("ParsePrefix(%q): %v", tc.prefix, err)
+			}
+			if got := prefix.PolicyID(registry.DeleteOldID); got != tc.want {
+				t.Errorf("PolicyID(%q) = %q, want %q", tc.prefix, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPrefixPolicyIDDistinguishesSubpathsOnOneRepository(t *testing.T) {
+	t.Parallel()
+
+	// The collision that scoping exists to prevent: two prefixes sharing a
+	// repository. Policy ids only have to be unique within a repository, so
+	// unscoped ids would have the second prefix silently overwrite the first.
+	seen := map[string]string{}
+	for _, spec := range []string{
+		districtsJobs,
+		districtsJobs + "/ltv2-",
+		districtsJobs + "/cedar_",
+		districtsJobs + "/a/b",
+	} {
+		prefix, err := registry.ParsePrefix(spec)
+		if err != nil {
+			t.Fatalf("ParsePrefix(%q): %v", spec, err)
+		}
+		for _, base := range []string{
+			registry.DeleteOldID, registry.KeepRecentID, registry.KeepProtectedID,
+		} {
+			id := prefix.PolicyID(base)
+			if other, clash := seen[id]; clash {
+				t.Errorf("%q and %q both produce policy id %q", spec, other, id)
+			}
+			seen[id] = spec
+		}
+	}
+}
+
+func TestPrefixPolicyIDStaysWithinTheLengthLimit(t *testing.T) {
+	t.Parallel()
+
+	// "must unique within a repository and be under 128 characters in length"
+	// — a long subpath must be shortened without two of them colliding, so the
+	// shortened form carries a digest of the whole scope.
+	long := districtsJobs + "/" + strings.Repeat("segment/", 30)
+	longer := districtsJobs + "/" + strings.Repeat("segment/", 31)
+
+	first, err := registry.ParsePrefix(long)
+	if err != nil {
+		t.Fatalf("ParsePrefix: %v", err)
+	}
+	second, err := registry.ParsePrefix(longer)
+	if err != nil {
+		t.Fatalf("ParsePrefix: %v", err)
+	}
+
+	a, b := first.PolicyID(registry.KeepProtectedID), second.PolicyID(registry.KeepProtectedID)
+	for _, id := range []string{a, b} {
+		if len(id) > 127 {
+			t.Errorf("policy id is %d characters, want at most 127: %q", len(id), id)
+		}
+	}
+	if a == b {
+		t.Errorf("two different long prefixes produced the same id %q", a)
 	}
 }

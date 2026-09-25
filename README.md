@@ -1,172 +1,203 @@
 <!-- vale Vale.Spelling = NO -->
 <!-- rumdl-disable-next-line MD063 -->
 # garbagetruck
+
 <!-- vale Vale.Spelling = YES -->
 
-`garbagetruck` removes Google Artifact Registry Docker images that nothing uses
-any more. Its first job is the opposite one: knowing exactly which images
-something still uses, so that it never removes those.
+`garbagetruck` keeps the container images a Kubernetes cluster still runs, and
+expires the rest from Google Artifact Registry. A GitOps manifest repository
+decides what counts as in use.
 
-## What Is Protected
+## Commands
 
-A GitOps Kubernetes manifest repository is the source of truth for which images
-a cluster runs. `garbagetruck protected` clones that repository over git+ssh
-into a temporary directory, reads every `*.yaml` and `*.yml` file in it, and
-collects every `image:` value into a sorted, de-duplicated map of image name to
-the versions it pins:
+| Command     | Reads                  | Writes                              |
+| ----------- | ---------------------- | ----------------------------------- |
+| `protected` | GitOps manifests       | Nothing                             |
+| `sync`      | Manifests and registry | `protected-` tags                   |
+| `policy`    | Registry               | Cleanup policies                    |
+| `sweep`     | Registry               | **Deletes versions.** Needs `--yes` |
+| `version`   | Build info             | Nothing                             |
 
-```json
-{
-  "us-central1-docker.pkg.dev/khan-academy/districts-jobs/cedar_umi_changed": [
-    { "tag": "webapp-034d2665381d9ab1eed1784a784c614be173f573" },
-    { "tag": "webapp-057cabe8414d1a7723deef50117707cd8e35b982" }
-  ]
-}
-```
+Run `sync` before `policy` or `sweep`. Both spare versions tagged
+`protected-`, and only `sync` writes those tags.
 
-Nothing in that map may be deleted.
+`--dry-run` works on every command that writes and means one thing throughout:
+`garbagetruck` writes nothing, because the function that writes is not called.
 
-A tag and a digest are separate fields, so a digest-pinned reference reads
-`{ "digest": "sha256:..." }` and a reference that writes both keeps both.
-References are parsed with [go-containerregistry][gcr], which also splits an
-image name into its registry and its namespace.
+## Flags
 
-An image written without a tag is reported as `latest`, because that is the
-image Kubernetes pulls for it. A value that names no image (a templating
-placeholder, say) is skipped, because it pins nothing that could be deleted.
+Manifests, for `protected` and `sync`:
 
-[gcr]: https://github.com/google/go-containerregistry
+| Flag                    | Environment variable           | Meaning                                 |
+| ----------------------- | ------------------------------ | --------------------------------------- |
+| `-r, --manifest-repo`   | `GARBAGETRUCK_MANIFEST_REPO`   | GitOps repository (required)            |
+| `-b, --manifest-branch` | `GARBAGETRUCK_MANIFEST_BRANCH` | Branch, default the repository's        |
+| `--ssh-key`             | `GARBAGETRUCK_SSH_KEY`         | Private key file, default the ssh-agent |
 
-## Usage
+Registry, for `sync`, `policy` and `sweep`:
+
+| Flag                            | Environment variable                       | Meaning                     |
+| ------------------------------- | ------------------------------------------ | --------------------------- |
+| `-p, --registry-prefix`         | `GARBAGETRUCK_REGISTRY_PREFIX`             | Registry subtree (required) |
+| `--impersonate-service-account` | `GARBAGETRUCK_IMPERSONATE_SERVICE_ACCOUNT` | Service account to act as   |
+
+Retention, for `policy` and `sweep`:
+
+| Flag                  | Environment variable             | Default | Meaning                            |
+| --------------------- | -------------------------------- | ------- | ---------------------------------- |
+| `--delete-older-than` | `GARBAGETRUCK_DELETE_OLDER_THAN` | `720h`  | Expire versions older than this    |
+| `--keep-most-recent`  | `GARBAGETRUCK_KEEP_MOST_RECENT`  | `5`     | Versions per image kept at any age |
+
+Every flag reads a `GARBAGETRUCK_`-prefixed environment variable. Manifest
+repositories clone over ssh through the agent. Registry access uses Application
+Default Credentials.
+
+Write the manifest repository as `github.com/Khan/districts-k8s`, as an
+`https://` URL, or as `git@host:owner/repo.git`. An explicit `ssh://` URL is
+used as given, so a non-standard port survives.
+
+## `protected`
+
+Reports what the manifests pin. Reads nothing else and changes nothing.
 
 ```console
-$ garbagetruck protected --manifest-repo github.com/Khan/districts-k8s
+$ garbagetruck protected -r github.com/Khan/districts-k8s
 us-central1-docker.pkg.dev/khan-academy/districts-jobs/cedar_umi_changed
 	webapp-034d2665381d9ab1eed1784a784c614be173f573
 	webapp-057cabe8414d1a7723deef50117707cd8e35b982
 ```
 
-Add `--json` for the map above rather than an indented listing.
+`--json` emits a map of image name to the versions it pins, with `tag` and
+`digest` as separate fields. An image written without a tag reports as `latest`
+because that is what Kubernetes pulls for it, while a value naming no image,
+such as a templating placeholder, is skipped entirely.
 
-| Flag                    | Environment variable           | Meaning                                     |
-| ----------------------- | ------------------------------ | ------------------------------------------- |
-| `-r, --manifest-repo`   | `GARBAGETRUCK_MANIFEST_REPO`   | GitOps repository to read (required)        |
-| `-b, --manifest-branch` | `GARBAGETRUCK_MANIFEST_BRANCH` | Branch to read; default is the repository's |
-| `--ssh-key`             | `GARBAGETRUCK_SSH_KEY`         | Private key file; default is the ssh-agent  |
-| `--json`                | `GARBAGETRUCK_JSON`            | Emit the map as JSON                        |
+## `sync`
 
-Write the repository as `github.com/Khan/districts-k8s`, as an `https://` URL,
-or in the `git@host:owner/repo.git` form. All three clone over ssh. An explicit
-`ssh://` URL is used as given, so a non-standard port or account survives.
+Makes the registry's `protected-` tags agree with the manifests.
 
-Authentication is by ssh-agent. `--ssh-key` reads a private key file instead,
-which is what a deployment with a mounted deploy key needs.
+- A version the manifests pin by tag gets `protected-` plus that tag.
+- A version pinned by digest alone gets `protected-digest-only`.
+- A `protected-` tag the manifests no longer justify is removed.
 
-## Protecting Those Images in the Registry
-
-`garbagetruck sync` makes a Google Artifact Registry repository agree with the
-manifests. It reads every image under a registry prefix and compares it with
-the manifests. From that comparison it maintains one family of tags:
-
-- an image the manifests pin by tag gets `protected-` plus that tag;
-- an image the manifests pin by digest alone gets `protected-digest-only`;
-- a `protected-` tag the manifests no longer justify is removed.
-
-No other tag is touched, and no image is ever deleted.
+No other tag is touched and no image is deleted.
 
 ```console
 $ garbagetruck sync --dry-run \
-    --manifest-repo github.com/Khan/districts-k8s \
-    --registry-prefix us-central1-docker.pkg.dev/khan-academy/districts-jobs
+    -r github.com/Khan/districts-k8s \
+    -p us-central1-docker.pkg.dev/khan-academy/districts-jobs
 would tag protected-webapp-034d266... on .../ltv2-to-assessments (sha256:1f0c...)
 would untag protected-webapp-9b21af0... on .../roster (sha256:77ae...)
 ```
 
-With `--dry-run` the registry is only read and the output says what would
-change. Without it, the same output says what did change. Read-only is
-structural rather than a flag consulted deep in the code: the one function that
-writes to the registry is not called at all.
+Two things `sync` reports but cannot fix. A manifest pinning a version the
+registry no longer holds means a cluster refers to an image already gone. And
+`protected-digest-only` is one name per image, so only one digest-pinned
+version of an image can hold it. The rest are named in the output.
 
-| Flag                            | Environment variable                       | Meaning                                  |
-| ------------------------------- | ------------------------------------------ | ---------------------------------------- |
-| `-p, --registry-prefix`         | `GARBAGETRUCK_REGISTRY_PREFIX`             | Registry subtree to reconcile (required) |
-| `-n, --dry-run`                 | `GARBAGETRUCK_DRY_RUN`                     | Describe changes; write nothing          |
-| `--impersonate-service-account` | `GARBAGETRUCK_IMPERSONATE_SERVICE_ACCOUNT` | Service account to act as                |
+## `policy`
 
-`sync` also takes the `--manifest-repo`, `--manifest-branch`, and `--ssh-key`
-flags described above. Registry access uses Application Default Credentials.
+Installs the Artifact Registry cleanup policies that give the tags their
+effect. Three rules, each scoped to the prefix:
 
-`sync` reports two things it cannot fix. A manifest that pins a version the
-registry no longer holds means a cluster refers to an image that is already
-gone. And because `protected-digest-only` is one name per image, only one
-digest-pinned version of an image can hold it. The rest are reported.
+| Rule                                  | Action                                             |
+| ------------------------------------- | -------------------------------------------------- |
+| `garbagetruck-delete-old-<scope>`     | Delete versions older than `--delete-older-than`   |
+| `garbagetruck-keep-recent-<scope>`    | Keep the `--keep-most-recent` newest of each image |
+| `garbagetruck-keep-protected-<scope>` | Keep anything tagged `protected-`                  |
 
-## Making the Tags Mean Something
+`<scope>` is the part of the prefix after the project, so
+`us-central1-docker.pkg.dev/khan-academy/districts-jobs` yields
+`garbagetruck-delete-old-districts-jobs`. Policy ids only have to be unique
+within a repository, so two repositories never collide. Two prefixes sharing a
+repository and differing by subpath would, and the scope prevents it.
 
-The `protected-` tags do nothing on their own. They matter because a repository
-cleanup policy keeps versions whose tags start with `protected-`.
-`garbagetruck policy` installs that policy, plus the two rules around it:
+Artifact Registry combines the rules with a logical or, and a keep rule wins
+over a delete rule, so a version survives if any keep rule matches. The two keep rules stay
+separate for that reason. Merged into one, a version would have to be both
+recent and protected to survive.
 
-| Rule                          | Action                                                                  |
-| ----------------------------- | ----------------------------------------------------------------------- |
-| `garbagetruck-delete-old`     | Delete versions older than `--delete-older-than` (default 30 days)      |
-| `garbagetruck-keep-recent`    | Keep the `--keep-most-recent` newest versions of each image (default 5) |
-| `garbagetruck-keep-protected` | Keep anything tagged `protected-`                                       |
+Policies `garbagetruck` did not write are left alone and reported. One of your
+own that also deletes will delete on top of these, so `policy` warns about it.
 
 ```console
-$ garbagetruck policy --dry-run \
-    --registry-prefix us-central1-docker.pkg.dev/khan-academy/districts-jobs
-would install garbagetruck-delete-old
-would install garbagetruck-keep-recent
-would install garbagetruck-keep-protected
+$ garbagetruck policy \
+    -p us-central1-docker.pkg.dev/khan-academy/districts-jobs \
+    --keep-most-recent 5 --delete-older-than 730h
+installed garbagetruck-delete-old-districts-jobs
+installed garbagetruck-keep-protected-districts-jobs
+installed garbagetruck-keep-recent-districts-jobs
+turned the registry cleanup pipeline on
 ```
 
-Artifact Registry evaluates rules against each other with OR, and a keep rule
-always wins over a delete rule, so a version survives if any keep rule matches
-it. The two keep rules stay separate for that reason. Combined into one, a
-version would have to be both recent and protected to survive, and everything
-protected but old would be deleted.
+Stored on the repository, those become:
 
-Policies this tool did not write are left in place and reported. A cleanup
-policy of your own that also deletes will delete on top of these rules, so
-`policy` warns when it finds one.
+```json
+{"id":"garbagetruck-delete-old-districts-jobs", "action":"DELETE",
+ "condition":{"olderThan":"2628000s"}}
+```
 
-### Order Matters
+`730h` is stored as a duration of `2628000s`, or 30.4 days. No rule carries
+`packageNamePrefixes` here because the prefix names the whole repository. A
+prefix with a subpath adds one to all three rules.
 
-These rules delete images that carry no `protected-` tag, and only `sync` adds
-those tags. Installing a live policy against a registry `sync` has never
-touched makes every version older than the window a candidate for deletion.
-
-Run `sync` first, or install with `--cleanup-dry-run` and read what the
-registry reports it would have deleted.
+Re-running changes nothing and says `cleanup policies already matched, nothing
+written`.
 
 ### Two Dry Runs
 
-They hold back different things, so they have different names. They can be
-combined.
+`policy` holds back two different things, so they have two names, and they
+combine.
 
-| Flag                | Holds back                          | Writes to the registry?                            |
-| ------------------- | ----------------------------------- | -------------------------------------------------- |
-| `--dry-run`         | `garbagetruck`                      | No. Prints the plan and stops.                     |
-| `--cleanup-dry-run` | The registry's own cleanup pipeline | Yes. Installs the policies with deletion disabled. |
+| Flag                | Holds back                      | Writes to the registry?                   |
+| ------------------- | ------------------------------- | ----------------------------------------- |
+| `--dry-run`         | `garbagetruck`                  | No. Prints the plan and stops             |
+| `--cleanup-dry-run` | The registry's cleanup pipeline | Yes. Installs the rules with deletion off |
 
-`--dry-run` means the same thing in every command: `garbagetruck` writes
-nothing.
+`turned the registry cleanup pipeline on` is the line that matters. Without it
+the rules are installed but inert.
+
+## `sweep`
+
+Deletes what the retention rules no longer spare, applying the same rules
+`policy` installs.
+
+| Rule                                               | Effect |
+| -------------------------------------------------- | ------ |
+| Tagged `protected-`                                | Keep   |
+| Among the `--keep-most-recent` newest of its image | Keep   |
+| Created more recently than `--delete-older-than`   | Keep   |
+| Anything else                                      | Delete |
+
+A keep rule wins over a delete rule. A version whose creation time the registry
+does not report is never deleted, because its age cannot be established.
+
+```console
+$ garbagetruck sweep --dry-run \
+    -p us-central1-docker.pkg.dev/khan-academy/districts-jobs \
+    --keep-most-recent 5 --delete-older-than 730h
+.../roster@sha256:3b9579... created 2023-02-16
+... and 73737 more
+73787 to delete; keeping 31 protected, 312 newest, 5320 too young, 0 undated
+```
+
+**Deletion cannot be undone.** Run `--dry-run` first and read the list.
+
+Two guards stand in the way of an accident. Deleting requires `--yes`, which
+has no short form on purpose and is checked before the listing, so a missing
+one costs a second rather than a full walk of the registry. Passing both
+`--dry-run` and `--yes` deletes nothing. Separately, `sweep` refuses to start
+when nothing under the prefix carries a `protected-` tag, since that means
+`sync` has never run and every image the cluster uses would look expendable.
+
+Once `policy` is installed the registry applies the same rules on its own
+schedule. `sweep` applies them now and prints what it removed.
 
 ## Scoping to Part of a Repository
 
-A cleanup policy attaches to a repository. The last segment of
-`us-central1-docker.pkg.dev/khan-academy/districts-jobs` is the repository
-itself, so that prefix is covered whole, and
-`.../districts-jobs/ltv2-to-assessments` along with it.
-
-A prefix with more path than that is confined with the registry's
-`PackageNamePrefixes`, which matches on a plain string prefix rather than a
-path prefix. `sync` matches packages the same way, deliberately: if one were
-path-aware and the other were not, a prefix of `ltv2-` would scope the delete
-rule to `ltv2-extra` while `sync` left that package unprotected.
-
-## What Is Never Done
-
-`garbagetruck` never deletes an image. Deciding what to delete is the cleanup
-policy's job. Deciding what to spare is this tool's.
+A cleanup policy attaches to a repository, so a prefix ending at the repository
+covers all of it. A longer prefix is confined with the registry's
+`packageNamePrefixes`, which matches a plain string prefix rather than a path
+prefix. `sync` matches packages the same way on purpose: were one path-aware
+and the other not, a prefix of `ltv2-` would scope the delete rule to
+`ltv2-extra` while `sync` left that package unprotected.
