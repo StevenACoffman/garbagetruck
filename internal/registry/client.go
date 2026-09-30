@@ -31,11 +31,6 @@ const (
 	retryMax     = 10 * time.Second
 )
 
-// deleteBatch bounds one BatchDeleteVersions call. The service caps the batch
-// size itself and does not document the number, so this stays well under any
-// plausible limit and keeps progress reporting granular.
-const deleteBatch = 200
-
 // Progress is called as a long operation advances: how many of how many
 // items are done, and the name of the one just handled. A nil Progress
 // reports nothing, which is what lets a caller opt out without every call
@@ -217,58 +212,50 @@ func (c *Client) DeleteVersions(
 	expired []garbagetruck.Expired,
 	onProgress Progress,
 ) (int, error) {
-	names, err := versionNames(prefix, expired)
+	batches, err := prefix.DeleteBatches(expired)
 	if err != nil {
 		return 0, err
 	}
 
 	var (
-		deleted int
-		errs    []error
+		deleted  int
+		seen     int
+		failures deleteFailures
 	)
-	for start := 0; start < len(names); start += deleteBatch {
-		batch := names[start:min(start+deleteBatch, len(names))]
-		onProgress.report(start+len(batch), len(names), "deleting")
-		if err := c.deleteBatch(ctx, prefix, batch); err != nil {
-			errs = append(errs, err)
+	for _, batch := range batches {
+		seen += len(batch.Names)
+		onProgress.report(seen, len(expired), batch.ID)
+		if err := c.deleteBatch(ctx, batch); err != nil {
+			failures.add(batch, err)
 			continue
 		}
-		deleted += len(batch)
+		deleted += len(batch.Names)
 	}
-	return deleted, errors.Join(errs...)
+	return deleted, failures.err()
 }
 
 // deleteBatch removes one batch and waits for the registry to finish, so that
 // a failure is reported against the batch that caused it rather than surfacing
 // long afterwards.
-func (c *Client) deleteBatch(ctx context.Context, prefix Prefix, names []string) error {
+//
+// The wrapping text is fixed, carrying neither the batch's size nor its
+// package. DeleteVersions groups batches by their cause to collapse a
+// systemic failure into one line, and per-batch text would make every cause
+// unique and defeat that; the counts and package names belong to the group,
+// not to each error. Rejection and mid-flight failure are worth telling
+// apart, so they wrap differently and group separately.
+func (c *Client) deleteBatch(ctx context.Context, batch DeleteBatch) error {
 	op, err := c.ar.BatchDeleteVersions(ctx, &artifactregistrypb.BatchDeleteVersionsRequest{
-		Parent: prefix.Parent(),
-		Names:  names,
+		Parent: batch.Package,
+		Names:  batch.Names,
 	})
 	if err != nil {
-		return fmt.Errorf("delete %d versions: %w", len(names), err)
+		return fmt.Errorf("batch rejected: %w", err)
 	}
 	if err := op.Wait(ctx); err != nil {
-		return fmt.Errorf("delete %d versions: %w", len(names), err)
+		return fmt.Errorf("batch failed: %w", err)
 	}
 	return nil
-}
-
-// versionNames maps expired versions onto Artifact Registry resource names,
-// failing as a whole if any of them falls outside prefix. A mismatch means
-// the caller and this client disagree about what is being swept, which is not
-// a thing to discover halfway through a deletion.
-func versionNames(prefix Prefix, expired []garbagetruck.Expired) ([]string, error) {
-	names := make([]string, 0, len(expired))
-	for i := range expired {
-		pkg, err := prefix.Package(expired[i].Repo)
-		if err != nil {
-			return nil, err
-		}
-		names = append(names, prefix.versionName(pkg, expired[i].Digest))
-	}
-	return names, nil
 }
 
 // packages resolves every package under prefix, so a caller knows how much
