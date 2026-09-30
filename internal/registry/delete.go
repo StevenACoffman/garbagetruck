@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -27,6 +28,15 @@ const maxDeleteBatch = 50
 // and a line that names thirty of them is the wall of text this collapsing
 // exists to prevent.
 const maxNamedPackages = 5
+
+// ErrVersionNotDeleted is the cause recorded for a version BatchDeleteVersions
+// returned in its metadata's FailedVersions.
+//
+// The operation completed, the registry did not delete the version, and it
+// gave no reason, so there is nothing to report but the fact. Sweeping again
+// is the remedy: the next run re-lists and asks once more for whatever is
+// still there.
+var ErrVersionNotDeleted = errors.New("registry reported the version as not deleted")
 
 // DeleteBatch is one BatchDeleteVersions request: the package the RPC must be
 // addressed to, and the version resource names within it to remove.
@@ -164,8 +174,12 @@ func (e *DeleteError) Unwrap() []error {
 	return causes
 }
 
-// add records one failed batch under its cause.
-func (f *deleteFailures) add(batch DeleteBatch, cause error) {
+// add records versions of one batch that were not deleted, under their cause.
+//
+// versions is passed rather than taken from the batch because a batch can
+// fail in part: BatchDeleteVersions may delete most of what it was given and
+// report the rest, and counting the whole batch then would overstate the loss.
+func (f *deleteFailures) add(batch DeleteBatch, versions int, cause error) {
 	key := cause.Error()
 	if f.byCause == nil {
 		f.byCause = make(map[string]*deleteFailure)
@@ -177,7 +191,7 @@ func (f *deleteFailures) add(batch DeleteBatch, cause error) {
 		f.order = append(f.order, key)
 	}
 	group.batches++
-	group.versions += len(batch.Names)
+	group.versions += versions
 	if !group.seen[batch.ID] {
 		group.seen[batch.ID] = true
 		group.packages = append(group.packages, batch.ID)

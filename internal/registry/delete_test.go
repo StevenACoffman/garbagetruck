@@ -299,7 +299,8 @@ func TestDeleteErrorCollapsesOneCauseAcrossManyBatches(t *testing.T) {
 	}
 
 	cap50 := errors.New("rpc error: A maximum of 50 versions are allowed per request")
-	failed := registry.CollapseForTest(batches, func(registry.DeleteBatch) error { return cap50 })
+	_, failed := registry.CollapseForTest(batches,
+		func(registry.DeleteBatch) (int, error) { return 0, cap50 })
 
 	var target *registry.DeleteError
 	if !errors.As(failed, &target) {
@@ -352,12 +353,13 @@ func TestDeleteErrorKeepsDistinctCausesApart(t *testing.T) {
 
 	denied := errors.New("PermissionDenied")
 	tooBig := errors.New("A maximum of 50 versions are allowed per request")
-	failed := registry.CollapseForTest(batches, func(batch registry.DeleteBatch) error {
-		if batch.ID == "precache" {
-			return denied
-		}
-		return tooBig
-	})
+	_, failed := registry.CollapseForTest(batches,
+		func(batch registry.DeleteBatch) (int, error) {
+			if batch.ID == "precache" {
+				return 0, denied
+			}
+			return 0, tooBig
+		})
 
 	var target *registry.DeleteError
 	if !errors.As(failed, &target) {
@@ -390,7 +392,8 @@ func TestDeleteErrorLeavesASingleBatchFailureUncollapsed(t *testing.T) {
 	}
 
 	boom := errors.New("PermissionDenied")
-	failed := registry.CollapseForTest(batches, func(registry.DeleteBatch) error { return boom })
+	_, failed := registry.CollapseForTest(batches,
+		func(registry.DeleteBatch) (int, error) { return 0, boom })
 
 	// A count of one adds only noise, so one batch reads as one plain line.
 	want := "delete 1 versions in roster: PermissionDenied"
@@ -421,7 +424,8 @@ func TestDeleteErrorTruncatesALongPackageList(t *testing.T) {
 	}
 
 	boom := errors.New("A maximum of 50 versions are allowed per request")
-	failed := registry.CollapseForTest(batches, func(registry.DeleteBatch) error { return boom })
+	_, failed := registry.CollapseForTest(batches,
+		func(registry.DeleteBatch) (int, error) { return 0, boom })
 
 	rendered := failed.Error()
 	if !strings.Contains(rendered, "10 packages") {
@@ -450,9 +454,127 @@ func TestDeleteErrorIsNilWhenEveryBatchSucceeds(t *testing.T) {
 		t.Fatalf("DeleteBatches: %v", err)
 	}
 
-	if failed := registry.CollapseForTest(batches, func(registry.DeleteBatch) error {
-		return nil
-	}); failed != nil {
+	deleted, failed := registry.CollapseForTest(batches,
+		func(batch registry.DeleteBatch) (int, error) { return len(batch.Names), nil })
+	if failed != nil {
 		t.Errorf("err = %v, want nil when nothing failed", failed)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+}
+
+// TestDeleteErrorCountsAPartiallyAppliedBatch is the regression test for a
+// sweep reporting more deletions than it performed. BatchDeleteVersions can
+// finish with no error while skipping versions, naming them in the
+// operation's metadata; the count must follow what was removed, not what was
+// requested.
+func TestDeleteErrorCountsAPartiallyAppliedBatch(t *testing.T) {
+	t.Parallel()
+
+	prefix, err := registry.ParsePrefix(districtsJobs)
+	if err != nil {
+		t.Fatalf("ParsePrefix: %v", err)
+	}
+
+	// Two full batches of 50 in one package.
+	var expired []garbagetruck.Expired
+	for i := range 100 {
+		expired = append(expired, expiredIn(t, "lockwatch", "sha256:"+strconv.Itoa(i)))
+	}
+	batches, err := prefix.DeleteBatches(expired)
+	if err != nil {
+		t.Fatalf("DeleteBatches: %v", err)
+	}
+	if len(batches) != 2 {
+		t.Fatalf("got %d batches, want 2", len(batches))
+	}
+
+	// The registry silently keeps 3 of the first batch and all of the second.
+	calls := 0
+	deleted, failed := registry.CollapseForTest(batches,
+		func(batch registry.DeleteBatch) (int, error) {
+			calls++
+			if calls == 1 {
+				return len(batch.Names) - 3, registry.ErrVersionNotDeleted
+			}
+			return len(batch.Names), nil
+		})
+
+	if deleted != 97 {
+		t.Errorf("deleted = %d, want 97 — the count must exclude skipped versions", deleted)
+	}
+
+	var target *registry.DeleteError
+	if !errors.As(failed, &target) {
+		t.Fatalf("err = %T, want *registry.DeleteError", failed)
+	}
+	// 3 versions lost, in 1 batch — not the 50 that batch carried.
+	if target.Versions() != 3 {
+		t.Errorf("Versions() = %d, want 3", target.Versions())
+	}
+	if target.Batches() != 1 {
+		t.Errorf("Batches() = %d, want 1", target.Batches())
+	}
+	if !errors.Is(failed, registry.ErrVersionNotDeleted) {
+		t.Error("errors.Is must reach ErrVersionNotDeleted")
+	}
+	want := "delete 3 versions in lockwatch: " + registry.ErrVersionNotDeleted.Error()
+	if got := failed.Error(); got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
+// TestDeleteErrorSeparatesSilentSkipsFromHardFailures keeps the two apart in
+// the report: a transient Unavailable is worth retrying, a silent skip needs
+// another sweep, and merging their counts would hide both.
+func TestDeleteErrorSeparatesSilentSkipsFromHardFailures(t *testing.T) {
+	t.Parallel()
+
+	prefix, err := registry.ParsePrefix(districtsJobs)
+	if err != nil {
+		t.Fatalf("ParsePrefix: %v", err)
+	}
+
+	var expired []garbagetruck.Expired
+	for i := range 50 {
+		expired = append(expired, expiredIn(t, "lms-connect", "sha256:l"+strconv.Itoa(i)))
+	}
+	for i := range 50 {
+		expired = append(expired, expiredIn(t, "lockwatch", "sha256:w"+strconv.Itoa(i)))
+	}
+	batches, err := prefix.DeleteBatches(expired)
+	if err != nil {
+		t.Fatalf("DeleteBatches: %v", err)
+	}
+
+	unavailable := errors.New("rpc error: code = Unavailable desc = " +
+		"The service is currently unavailable.")
+	deleted, failed := registry.CollapseForTest(batches,
+		func(batch registry.DeleteBatch) (int, error) {
+			if batch.ID == "lms-connect" {
+				return 0, unavailable // whole batch rejected
+			}
+			return len(batch.Names) - 10, registry.ErrVersionNotDeleted // silent skip
+		})
+
+	if deleted != 40 {
+		t.Errorf("deleted = %d, want 40", deleted)
+	}
+
+	var target *registry.DeleteError
+	if !errors.As(failed, &target) {
+		t.Fatalf("err = %T, want *registry.DeleteError", failed)
+	}
+	if target.Versions() != 60 {
+		t.Errorf("Versions() = %d, want 60 (50 rejected + 10 skipped)", target.Versions())
+	}
+	lines := strings.Split(target.Error(), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("rendered %d lines, want 3 (summary + 2 causes):\n%s",
+			len(lines), target.Error())
+	}
+	if !errors.Is(failed, unavailable) || !errors.Is(failed, registry.ErrVersionNotDeleted) {
+		t.Error("both causes must remain reachable")
 	}
 }

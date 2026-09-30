@@ -225,11 +225,11 @@ func (c *Client) DeleteVersions(
 	for _, batch := range batches {
 		seen += len(batch.Names)
 		onProgress.report(seen, len(expired), batch.ID)
-		if err := c.deleteBatch(ctx, batch); err != nil {
-			failures.add(batch, err)
-			continue
+		done, err := c.deleteBatch(ctx, batch)
+		deleted += done
+		if err != nil {
+			failures.add(batch, len(batch.Names)-done, err)
 		}
-		deleted += len(batch.Names)
 	}
 	return deleted, failures.err()
 }
@@ -238,24 +238,43 @@ func (c *Client) DeleteVersions(
 // a failure is reported against the batch that caused it rather than surfacing
 // long afterwards.
 //
+// It returns how many versions the registry actually removed, which is not
+// always how many it was asked to remove: BatchDeleteVersions is a
+// partial-success operation. It can finish with Wait reporting no error at
+// all, having skipped some of the versions it was given and named them in the
+// operation's metadata instead. Counting a completed batch as wholly applied
+// is what made a sweep report more deletions than it performed.
+//
 // The wrapping text is fixed, carrying neither the batch's size nor its
 // package. DeleteVersions groups batches by their cause to collapse a
 // systemic failure into one line, and per-batch text would make every cause
 // unique and defeat that; the counts and package names belong to the group,
-// not to each error. Rejection and mid-flight failure are worth telling
-// apart, so they wrap differently and group separately.
-func (c *Client) deleteBatch(ctx context.Context, batch DeleteBatch) error {
+// not to each error. Rejection, mid-flight failure, and a silent skip are
+// worth telling apart, so each carries its own cause and groups separately.
+func (c *Client) deleteBatch(ctx context.Context, batch DeleteBatch) (int, error) {
 	op, err := c.ar.BatchDeleteVersions(ctx, &artifactregistrypb.BatchDeleteVersionsRequest{
 		Parent: batch.Package,
 		Names:  batch.Names,
 	})
 	if err != nil {
-		return fmt.Errorf("batch rejected: %w", err)
+		return 0, fmt.Errorf("batch rejected: %w", err)
 	}
 	if err := op.Wait(ctx); err != nil {
-		return fmt.Errorf("batch failed: %w", err)
+		return 0, fmt.Errorf("batch failed: %w", err)
 	}
-	return nil
+
+	// Metadata does not call the server; it reads what the final poll inside
+	// Wait already returned. A nil result means the server sent none, which is
+	// not evidence of a skip, so the batch counts as applied.
+	meta, err := op.Metadata()
+	if err != nil {
+		return 0, fmt.Errorf("batch delete metadata: %w", err)
+	}
+	skipped := len(meta.GetFailedVersions())
+	if skipped == 0 {
+		return len(batch.Names), nil
+	}
+	return len(batch.Names) - skipped, ErrVersionNotDeleted
 }
 
 // packages resolves every package under prefix, so a caller knows how much
